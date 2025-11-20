@@ -1,258 +1,207 @@
+#!/usr/bin/env python3
 """
-Rewritten ai_glasses_direct.py for Raspberry Pi 4 (Bullseye/Bookworm) using:
- - Picamera2 (camera)
- - ultralytics YOLO (lightweight detection)
- - Vosk (offline speech recognition)
- - pico2wave + aplay (offline TTS)
-
-Save this file as ai_glasses_pi_ready.py on the Pi and run with python3.
-
-Dependencies (install before running):
-# apt packages
-sudo apt update && sudo apt install -y python3-picamera2 python3-opencv libatlas-base-dev \
-    libsndfile1 ffmpeg libttspico-utils aplay wget build-essential
-
-# python packages (inside venv recommended)
-python3 -m pip install --upgrade pip
-python3 -m pip install ultralytics vosk numpy pygame
-
-# Vosk model (one-time):
-# Download a small-en-us model (e.g. vosk-model-small-en-us-0.15) and unzip to /home/pi/vosk-model-small
-# Example (run once):
-# wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
-# unzip vosk-model-small-en-us-0.15.zip -d /home/pi/
-
-Notes:
- - Replace GOOGLE_MAPS_API_KEY with your key if you want navigation (requires internet).
- - This script uses offline TTS (pico2wave) and offline ASR (Vosk) for responsive performance.
- - ultralytics YOLO expects model weights (it will auto-download yolov8n by default on first run).
-
+ai_glasses_onnx.py
+YOLOv5n ONNX + ONNXRuntime object detection on Raspberry Pi (Picamera2).
+Uses Vosk for offline voice commands and pico2wave + aplay for offline TTS.
+Place yolov5n.onnx next to this script.
 """
 
 import os
 import time
-import threading
-import datetime
-from queue import Queue
-
 import numpy as np
 import cv2
-
-# Camera: Picamera2
 from picamera2 import Picamera2
-
-# Object detection: ultralytics YOLO
-from ultralytics import YOLO
-
-# Speech recognition: Vosk (offline)
-from vosk import Model as VoskModel, KaldiRecognizer
+import onnxruntime as ort
 import sounddevice as sd
 import json
-
-# TTS: pico2wave (offline) + aplay to play wav
+from vosk import Model as VoskModel, KaldiRecognizer
 import subprocess
+import datetime
+from queue import Queue
+import threading
 
-# Google Maps (optional)
-try:
-    import googlemaps
-except Exception:
-    googlemaps = None
+# ---------- Config ----------
+MODEL_PATH = "yolov5n.onnx"
+CAM_RES = (320, 240)
+CAM_FPS = 15
+CONF_THRESHOLD = 0.3
+VOSK_MODEL_PATH = os.path.expanduser("~/vosk-model-small-en-us-0.15")
+# ----------------------------------------------------------------------
 
-# ---------------- Configuration ----------------
-CAMERA_RESOLUTION = (320, 240)
-CAMERA_FRAMERATE = 15
-VOICE_COMMAND_CHECK_SEC = 1.0  # interval to check for voice commands (seconds)
-DETECTION_CONFIDENCE_THRESHOLD = 0.3
-GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')  # set via env var if needed
-CURRENT_LOCATION = "Your Current Location"  # placeholder
-VOSK_MODEL_PATH = os.path.expanduser("~/vosk-model-small-en-us-0.15")  # adjust to where you unzipped
-
-# ------------------ Utilities ------------------
-
-def tts_pico(text: str, filename: str = "temp_tts.wav"):
-    """Generate speech using pico2wave and play with aplay (blocking)."""
+def tts_pico(text, wav="temp_tts.wav"):
     try:
-        # Create wave file
-        cmd = ["pico2wave", "-w", filename, text]
-        subprocess.run(cmd, check=True)
-        # Play it
-        subprocess.run(["aplay", filename], check=True)
-        # Remove file
+        subprocess.run(["pico2wave", "-w", wav, text], check=True)
+        subprocess.run(["aplay", wav], check=True)
         try:
-            os.remove(filename)
-        except Exception:
+            os.remove(wav)
+        except:
             pass
     except Exception as e:
-        print(f"TTS error: {e}")
+        print("TTS error:", e)
 
-# Non-blocking TTS queue + worker
-speech_queue = Queue()
-
+# non-blocking TTS worker
+speech_q = Queue()
 def speech_worker():
     while True:
-        txt = speech_queue.get()
+        txt = speech_q.get()
         if txt is None:
             break
         tts_pico(txt)
+t_thread = threading.Thread(target=speech_worker, daemon=True)
+t_thread.start()
 
-speech_thread = threading.Thread(target=speech_worker, daemon=True)
-speech_thread.start()
+def speak(text):
+    speech_q.put(text)
 
-def speak(text: str):
-    speech_queue.put(text)
-
-# ------------------ Vosk (offline ASR) ------------------
-if not os.path.exists(VOSK_MODEL_PATH):
-    print(f"Warning: Vosk model not found at {VOSK_MODEL_PATH}. Voice commands will be disabled until model is downloaded.")
-    vosk_model = None
+# ---------- Vosk setup ----------
+if os.path.exists(VOSK_MODEL_PATH):
+    vosk_model = VoskModel(VOSK_MODEL_PATH)
 else:
-    try:
-        vosk_model = VoskModel(VOSK_MODEL_PATH)
-        # Use 16kHz mono audio for Vosk
-        rec = KaldiRecognizer(vosk_model, 16000)
-    except Exception as e:
-        print(f"Failed to load Vosk model: {e}")
-        vosk_model = None
-        rec = None
+    print("Vosk model not found at", VOSK_MODEL_PATH)
+    vosk_model = None
 
-# Function to record a short clip and run recognition
-def listen_offline(duration=2.0, samplerate=16000):
+def listen_vosk(duration=1.5, sr=16000):
     if vosk_model is None:
         return None
     try:
-        audio = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1, dtype='int16')
+        rec = KaldiRecognizer(vosk_model, sr)
+        data = sd.rec(int(duration*sr), samplerate=sr, channels=1, dtype='int16')
         sd.wait()
-        data = audio.tobytes()
-        r = KaldiRecognizer(vosk_model, samplerate)
-        if r.AcceptWaveform(data):
-            res = json.loads(r.Result())
-            text = res.get('text', '').lower()
-            return text
+        if rec.AcceptWaveform(data.tobytes()):
+            res = json.loads(rec.Result())
+            return res.get("text","").lower()
         else:
-            res = json.loads(r.PartialResult())
-            return res.get('partial', '').lower()
+            res = json.loads(rec.PartialResult())
+            return res.get("partial","").lower()
     except Exception as e:
-        print(f"Vosk listening error: {e}")
+        print("Vosk listen error:", e)
         return None
 
-# ------------------ Camera Setup (Picamera2) ------------------
+# ---------- Load ONNX model ----------
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"ONNX model not found: {MODEL_PATH}")
+
+providers = ['CPUExecutionProvider']
+sess = ort.InferenceSession(MODEL_PATH, providers=providers)
+input_name = sess.get_inputs()[0].name
+print("ONNX model loaded.")
+
+# Helper: preprocess for YOLOv5 ONNX (assuming NCHW, scale 0-1, letterbox)
+def letterbox(img, new_shape=(320,320), color=(114,114,114)):
+    shape = img.shape[:2]  # current shape [h, w]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+    dw //= 2; dh //= 2
+    resized = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+    top, bottom = dh, dh
+    left, right = dw, dw
+    padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return padded, r, (left, top)
+
+def xywh2xyxy(x):
+    # x is [x_center, y_center, w, h]
+    y = np.copy(x)
+    y[0] = x[0] - x[2]/2
+    y[1] = x[1] - x[3]/2
+    y[2] = x[0] + x[2]/2
+    y[3] = x[1] + x[3]/2
+    return y
+
+# Colors for boxes
+BOX_COLOR = (0,255,0)
+
+# ---------- Camera ----------
 picam2 = Picamera2()
-config = picam2.create_preview_configuration(main={"size": CAMERA_RESOLUTION})
+config = picam2.create_preview_configuration(main={"size": CAM_RES})
 picam2.configure(config)
 picam2.start()
-print("Camera started with Picamera2")
+time.sleep(0.1)
+print("Camera started.")
 
-# ------------------ Load YOLO Model (ultralytics) ------------------
-print("Loading YOLO model (yolov8n)...")
-try:
-    yolo = YOLO('yolov8n.pt')  # will download if not present
-    print("YOLO model ready")
-except Exception as e:
-    print(f"Failed to load YOLO model: {e}")
-    yolo = None
-
-# ------------------ Google Maps client (optional) ------------------
-if GOOGLE_MAPS_API_KEY and googlemaps is not None:
-    gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
-else:
-    gmaps = None
-
-# ------------------ Helper: estimate distance (simple) ------------------
-def estimate_distance(box_width_px, focal_length=615, real_width_m=0.5):
-    try:
-        if box_width_px <= 0:
-            return None
-        return (real_width_m * focal_length) / float(box_width_px)
-    except Exception:
-        return None
-
-# ------------------ Main Loop ------------------
+# ---------- Main loop ----------
+frame_count = 0
+last_voice_check = time.time()
+speak("Smart glasses starting with ONNX detection")
 
 try:
-    speak("Smart glasses starting")
-    last_voice_check = time.time()
-
-    detection_texts = []
-    frame_count = 0
-
     while True:
-        frame = picam2.capture_array()
-        # frame is RGB; convert to BGR for OpenCV display/drawing
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        frame = picam2.capture_array()  # RGB
+        img = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        # prepare input
+        img0 = img.copy()
+        img_in, ratio, (pad_x, pad_y) = letterbox(img0, new_shape=(CAM_RES[1], CAM_RES[0]))
+        img_in = cv2.cvtColor(img_in, cv2.COLOR_BGR2RGB)
+        img_in = img_in.astype(np.float32) / 255.0
+        img_in = np.transpose(img_in, (2,0,1))[np.newaxis, ...]  # 1x3xHxW
 
-        # Run detection occasionally to save CPU
-        if yolo is not None and frame_count % 1 == 0:
-            results = yolo(frame, imgsz=CAMERA_RESOLUTION, conf=DETECTION_CONFIDENCE_THRESHOLD, verbose=False)
-            detection_texts = []
-            # ultralytics returns results list
-            for r in results:
-                boxes = r.boxes
-                for box in boxes:
-                    conf = float(box.conf[0]) if box.conf is not None else 0.0
-                    cls_idx = int(box.cls[0]) if box.cls is not None else None
-                    if conf < DETECTION_CONFIDENCE_THRESHOLD:
-                        continue
-                    xyxy = box.xyxy[0].cpu().numpy()
-                    x1, y1, x2, y2 = map(int, xyxy)
-                    label = yolo.model.names[cls_idx] if cls_idx is not None and cls_idx in yolo.model.names else str(cls_idx)
-                    box_w = x2 - x1
-                    distance = estimate_distance(box_w)
-                    if distance and distance < 10:
-                        detection_texts.append(f"{label} at {distance:.1f}m")
-                    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0,255,0), 2)
-                    cv2.putText(frame_bgr, f"{label} {distance:.1f}m" if distance else label,
-                                (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 1)
+        # run inference
+        pred = sess.run(None, {input_name: img_in})[0]  # shape depends on model export
+        # Typical YOLOv5 ONNX export returns (1, boxes, 85) or similar. We need to parse.
+        # We'll handle common case: outputs shape (1, N, 85) -> xywh + conf + classes
+        if pred is None:
+            continue
+        out = pred[0] if pred.shape[0] == 1 else pred  # (N,85)
+        # Filter by confidence (objectness * class conf)
+        detection_texts = []
+        for det in out:
+            # det: [x, y, w, h, conf, class0_conf, class1_conf, ...] or sometimes [x,y,w,h,conf,cls]
+            conf_obj = float(det[4])
+            if conf_obj < CONF_THRESHOLD:
+                continue
+            # find class with max score (if class scores present)
+            if det.shape[0] > 6:
+                class_scores = det[5:]
+                cls_idx = int(np.argmax(class_scores))
+                cls_conf = float(class_scores[cls_idx])
+                score = conf_obj * cls_conf
+            else:
+                cls_idx = int(det[5]) if det.shape[0] > 5 else 0
+                score = conf_obj
+            if score < CONF_THRESHOLD:
+                continue
+            xywh = det[:4]
+            # convert xywh back to original image scale
+            x_center, y_center, w, h = xywh
+            # scale back using ratio and padding
+            x_center = (x_center - pad_x) / ratio
+            y_center = (y_center - pad_y) / ratio
+            w = w / ratio
+            h = h / ratio
+            xyxy = [x_center - w/2, y_center - h/2, x_center + w/2, y_center + h/2]
+            x1, y1, x2, y2 = map(int, xyxy)
+            # label (we'll use COCO names if available file not included — default to class index)
+            label = str(cls_idx)
+            # distance estimation (fast heuristic)
+            box_w = x2 - x1
+            distance = None
+            if box_w > 0:
+                distance = (0.5 * 615) / box_w
+            text = f"{label} {distance:.1f}m" if distance else label
+            detection_texts.append(text)
+            # draw
+            cv2.rectangle(img, (x1,y1), (x2,y2), BOX_COLOR, 2)
+            cv2.putText(img, text, (x1, max(0,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, BOX_COLOR, 1)
 
-        # Periodically check for voice commands (non-blocking)
-        if vosk_model is not None and (time.time() - last_voice_check) >= VOICE_COMMAND_CHECK_SEC:
+        # Voice command check every ~1s
+        if (time.time() - last_voice_check) > 1.0 and vosk_model is not None:
             last_voice_check = time.time()
-            cmd = listen_offline(duration=1.5)
+            cmd = listen_vosk(duration=1.2)
             if cmd:
-                print(f"[Voice] {cmd}")
-                if any(w in cmd for w in ["stop", "quit", "exit"]):
+                print("[VOICE]", cmd)
+                if "stop" in cmd or "exit" in cmd or "quit" in cmd:
                     speak("Shutting down smart glasses")
                     break
                 if "what time" in cmd or "time is it" in cmd:
                     now = datetime.datetime.now().strftime("%I:%M %p")
                     speak(f"The time is {now}")
-                elif "describe surroundings" in cmd or "describe" in cmd:
+                if "describe" in cmd or "surroundings" in cmd:
                     if detection_texts:
                         speak("Surroundings: " + ", ".join(detection_texts[:6]))
                     else:
                         speak("No objects detected nearby")
-                elif "identify" in cmd or "what is" in cmd:
-                    if detection_texts:
-                        speak("Identified: " + ", ".join(detection_texts[:6]))
-                    else:
-                        speak("No objects detected nearby")
-                elif "find route to" in cmd and gmaps is not None:
-                    dest = cmd.split("find route to")[-1].strip()
-                    if dest:
-                        speak(f"Searching route to {dest}")
-                        try:
-                            directions = gmaps.directions(CURRENT_LOCATION, dest, mode="walking")
-                            if directions:
-                                steps = directions[0]['legs'][0]['steps']
-                                for step in steps:
-                                    instr = step['html_instructions']
-                                    # strip HTML tags naively
-                                    instr = instr.replace('<b>', '').replace('</b>', '').replace('<div style="font-size:0.9em">', '').replace('</div>', '')
-                                    speak(instr)
-                                    time.sleep(1)
-                                speak("You have arrived")
-                            else:
-                                speak("No route found")
-                        except Exception as e:
-                            print(f"GMAP error: {e}")
-                            speak("Error getting directions")
-                    else:
-                        speak("Please say the place name")
-
-        # Optional: show frame on attached display (if available)
-        # Convert back to RGB for proper display if needed
-        # cv2.imshow('Frame', frame_bgr)
-        # if cv2.waitKey(1) & 0xFF == ord('q'):
-        #     break
 
         frame_count += 1
 
@@ -262,9 +211,8 @@ except KeyboardInterrupt:
 finally:
     try:
         picam2.close()
-    except Exception:
+    except:
         pass
-    # stop speech thread
-    speech_queue.put(None)
-    speech_thread.join(timeout=1)
-    print("Cleaned up and exiting")
+    speech_q.put(None)
+    t_thread.join(timeout=1)
+    print("Exiting.")
